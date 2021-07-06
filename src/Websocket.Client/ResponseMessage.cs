@@ -1,15 +1,24 @@
-﻿using System.Net.WebSockets;
+﻿using System;
+using System.Collections.Generic;
+using System.Net.WebSockets;
+using System.Runtime.CompilerServices;
 
 namespace Websocket.Client
 {
     /// <summary>
     /// Received message, could be Text or Binary
     /// </summary>
+
+
     public class ResponseMessage
     {
-        private ResponseMessage(byte[] binary, string text, WebSocketMessageType messageType)
+        private ResponseMessage(byte[] baseBuffer, string text, WebSocketMessageType messageType)
         {
-            Binary = binary;
+            if(baseBuffer != null)
+            {
+                _binary = new ArraySegment<byte>(baseBuffer);
+                _binStrucSize = Unsafe.SizeOf<ArraySegment<byte>>();
+            }
             Text = text;
             MessageType = messageType;
         }
@@ -18,11 +27,12 @@ namespace Websocket.Client
         /// Received text message (only if type = WebSocketMessageType.Text)
         /// </summary>
         public string Text { get; }
-
+        private int _binStrucSize;
+        private ArraySegment<byte> _binary;
         /// <summary>
-        /// Received text message (only if type = WebSocketMessageType.Binary)
+        /// Received binary message (only if type = WebSocketMessageType.Binary)
         /// </summary>
-        public byte[] Binary { get; }
+        public ref ArraySegment<byte> Binary { get => ref _binary; }
 
         /// <summary>
         /// Current message type (Text or Binary)
@@ -39,9 +49,33 @@ namespace Websocket.Client
                 return Text;
             }
 
-            return $"Type binary, length: {Binary?.Length}";
+            return $"Type binary, length: {Binary.Count}";
         }
 
+        ///<summary>
+        ///Copies into the buffer and resizes ArraySegment
+        ///</summary>
+        internal unsafe void CopyInto(byte[] source, int size)
+        {
+            Array.Copy(source, Binary.Array, size);          
+            var ptrToArray = (int*)Unsafe.AsPointer(ref _binary);
+            //32 bit because pointer to array is only 4 bytes
+            if(_binStrucSize == 12)
+            {
+                //set offset back to 0
+                ptrToArray[1] = 0;
+                //set count to new size
+                ptrToArray[2] = size;
+            }
+            //64 bit because pointer to array is 8 bytes
+            else if(_binStrucSize == 16)
+            {
+                //set offset back to 0
+                ptrToArray[2] = 0;
+                //set count to new size
+                ptrToArray[3] = size;
+            }
+        }
         /// <summary>
         /// Create text response message
         /// </summary>

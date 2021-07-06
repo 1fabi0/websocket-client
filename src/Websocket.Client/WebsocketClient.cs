@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -20,14 +21,14 @@ namespace Websocket.Client
     /// </summary>
     public partial class WebsocketClient : IWebsocketClient
     {
-        private static readonly ILog Logger = GetLogger();
+        private static readonly ILog Logger = GetLogger(); 
 
         private readonly WebsocketAsyncLock _locker = new WebsocketAsyncLock();
         private readonly Func<Uri, CancellationToken, Task<WebSocket>> _connectionFactory;
 
         private Uri _url;
         private Timer _lastChanceTimer;
-        private DateTime _lastReceivedMsg = DateTime.UtcNow; 
+        private DateTime _lastReceivedMsg = DateTime.UtcNow;
 
         private bool _disposing;
         private bool _reconnecting;
@@ -46,8 +47,10 @@ namespace Websocket.Client
         /// </summary>
         /// <param name="url">Target websocket url (wss://)</param>
         /// <param name="clientFactory">Optional factory for native ClientWebSocket, use it whenever you need some custom features (proxy, settings, etc)</param>
-        public WebsocketClient(Uri url, Func<ClientWebSocket> clientFactory = null)
-            : this(url, GetClientFactory(clientFactory))
+        /// <param name="receivingBuffers">Amount of possible useable ResponseMessages for binary messages</param>
+        /// <param name="receivingBufferSize">Maximum size of bytes in a ResponseMessage buffer</param>
+        public WebsocketClient(Uri url, int receivingBuffers, int receivingBufferSize, Func<ClientWebSocket> clientFactory = null)
+            : this(url, GetClientFactory(clientFactory), receivingBuffers, receivingBufferSize)
         {
         }
 
@@ -56,10 +59,17 @@ namespace Websocket.Client
         /// </summary>
         /// <param name="url">Target websocket url (wss://)</param>
         /// <param name="connectionFactory">Optional factory for native creating and connecting to a websocket. The method should return a <see cref="WebSocket"/> which is connected. Use it whenever you need some custom features (proxy, settings, etc)</param>
-        public WebsocketClient(Uri url, Func<Uri, CancellationToken, Task<WebSocket>> connectionFactory)
+        /// <param name="receivingBuffers">Amount of possible useable ResponseMessages for binary messages</param>
+        /// <param name="receivingBufferSize">Maximum size of bytes in a ResponseMessage buffer</param>
+        public WebsocketClient(Uri url, Func<Uri, CancellationToken, Task<WebSocket>> connectionFactory, int receivingBuffers, int receivingBufferSize)
         {
             Validations.Validations.ValidateInput(url, nameof(url));
-
+            _receivingBuffersSize = receivingBufferSize;
+            _binaryResponseMessages = new List<ResponseMessage>();
+            for(int i = 0; i < receivingBuffers; i++)
+            {
+                _binaryResponseMessages.Add(ResponseMessage.BinaryMessage(new byte[_receivingBuffersSize]));
+            }
             _url = url;
             _connectionFactory = connectionFactory ?? (async (uri, token) =>
             {
@@ -287,6 +297,7 @@ namespace Websocket.Client
 
             StartBackgroundThreadForSendingText();
             StartBackgroundThreadForSendingBinary();
+            StartBackgroundThreadForSendingBinarySegments();
         }
 
         private async Task<bool> StopInternal(WebSocket client, WebSocketCloseStatus status, string statusDescription, 
@@ -398,168 +409,7 @@ namespace Websocket.Client
             return _client.State == WebSocketState.Open;
         }
 
-        private async Task Listen(WebSocket client, CancellationToken token)
-        { 
-            Exception causedException = null;
-            try
-            {
-                // define buffer here and reuse, to avoid more allocation
-                const int chunkSize = 1024 * 4;
-                var buffer = new ArraySegment<byte>(new byte[chunkSize]);
-
-                do
-                {
-                    WebSocketReceiveResult result;
-                    byte[] resultArrayWithTrailing = null;
-                    var resultArraySize = 0;
-                    var isResultArrayCloned = false;
-                    MemoryStream ms = null;
-
-                    while (true)
-                    {
-                        result = await client.ReceiveAsync(buffer, token);
-                        var currentChunk = buffer.Array;
-                        var currentChunkSize = result.Count;
-
-                        var isFirstChunk = resultArrayWithTrailing == null;
-                        if (isFirstChunk)
-                        {
-                            // first chunk, use buffer as reference, do not allocate anything
-                            resultArraySize += currentChunkSize;
-                            resultArrayWithTrailing = currentChunk;
-                            isResultArrayCloned = false;
-                        }
-                        else if(currentChunk == null)
-                        {
-                            // weird chunk, do nothing
-                        }
-                        else
-                        {
-                            // received more chunks, lets merge them via memory stream
-                            if (ms == null)
-                            {
-                                // create memory stream and insert first chunk
-                                ms = new MemoryStream();
-                                ms.Write(resultArrayWithTrailing, 0, resultArraySize);
-                            }
-
-                            // insert current chunk
-                            ms.Write(currentChunk, buffer.Offset, currentChunkSize);
-                        }
-
-                        if (result.EndOfMessage)
-                        {
-                            break;
-                        }
-
-                        if(isResultArrayCloned)
-                            continue;
-
-                        // we got more chunks incoming, need to clone first chunk
-                        resultArrayWithTrailing = resultArrayWithTrailing?.ToArray();
-                        isResultArrayCloned = true;
-                    }
-
-                    ms?.Seek(0, SeekOrigin.Begin);
-
-                    ResponseMessage message;
-                    if (result.MessageType == WebSocketMessageType.Text && IsTextMessageConversionEnabled)
-                    {
-                        var data = ms != null ?
-                            GetEncoding().GetString(ms.ToArray()) :
-                            resultArrayWithTrailing != null ?
-                                GetEncoding().GetString(resultArrayWithTrailing, 0, resultArraySize) :
-                                null;
-
-                        message = ResponseMessage.TextMessage(data);
-                    }
-                    else if (result.MessageType == WebSocketMessageType.Close)
-                    {
-                        Logger.Trace(L($"Received close message"));
-
-                        if(!IsStarted || _stopping)
-                        {
-                            return;
-                        }
-
-                        var info = DisconnectionInfo.Create(DisconnectionType.ByServer, client, null);
-                        _disconnectedSubject.OnNext(info);
-
-                        if (info.CancelClosing)
-                        {
-                            // closing canceled, reconnect if enabled
-                            if (IsReconnectionEnabled)
-                            {
-                                throw new OperationCanceledException("Websocket connection was closed by server");
-                            }
-
-                            continue;
-                        }
-
-                        await StopInternal(client, WebSocketCloseStatus.NormalClosure, "Closing",
-                            token, false, true);
-
-                        // reconnect if enabled
-                        if (IsReconnectionEnabled && !ShouldIgnoreReconnection(client))
-                        {
-                            _ = ReconnectSynchronized(ReconnectionType.Lost, false, null);
-                        }
-
-                        return;
-                    }
-                    else
-                    {
-                        if (ms != null)
-                        {
-                            message = ResponseMessage.BinaryMessage(ms.ToArray());
-                        }
-                        else
-                        {
-                            Array.Resize(ref resultArrayWithTrailing, resultArraySize);
-                            message = ResponseMessage.BinaryMessage(resultArrayWithTrailing);
-                        }
-                    }
-
-                    ms?.Dispose();
-
-                    Logger.Trace(L($"Received:  {message}"));
-                    _lastReceivedMsg = DateTime.UtcNow;
-                    _messageReceivedSubject.OnNext(message);
-
-                } while (client.State == WebSocketState.Open && !token.IsCancellationRequested);
-            }
-            catch (TaskCanceledException e)
-            {
-                // task was canceled, ignore
-                causedException = e;
-            }
-            catch (OperationCanceledException e)
-            {
-                // operation was canceled, ignore
-                causedException = e;
-            }
-            catch (ObjectDisposedException e)
-            {
-                // client was disposed, ignore
-                causedException = e;
-            }
-            catch (Exception e)
-            {
-                Logger.Error(e, L($"Error while listening to websocket stream, error: '{e.Message}'"));
-                causedException = e;
-            }
-
-
-            if (ShouldIgnoreReconnection(client) || !IsStarted)
-            {
-                // reconnection already in progress or client stopped/disposed, do nothing
-                return;
-            }
-
-            // listening thread is lost, we have to reconnect
-            _ = ReconnectSynchronized(ReconnectionType.Lost, false, causedException);
-        }
-
+        
         private bool ShouldIgnoreReconnection(WebSocket client)
         {
             // reconnection already in progress or client stopped/ disposed,
